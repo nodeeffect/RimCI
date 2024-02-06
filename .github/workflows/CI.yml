@@ -1,0 +1,459 @@
+name: CI
+
+on:
+  push:
+  pull_request_target:
+  workflow_dispatch:
+
+  # NOTE: if this event doesn't seem to work, see https://stackoverflow.com/a/75672834/544947
+  pull_request_review:
+
+  schedule:
+    # once a month
+    - cron: "0 0 1 * *"
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+  ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+  IOS_DISTRIBUTION_CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+
+jobs:
+  pre-conventions:
+    name: Check commits 1 by 1
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-22.04
+    container:
+      image: "ubuntu:22.04"
+    steps:
+      - name: Install dependencies
+        run: |
+          which sudo 2>/dev/null || (apt update && apt install --yes sudo)
+          sudo apt update
+          sudo apt install --yes --no-install-recommends git
+      - name: Setup .NET
+        run: |
+          # We need to install `ca-certificates`, otherwise we get these errors in the CI:
+          # Unable to load the service index for source https://api.nuget.org/v3/index.json.
+          # The SSL connection could not be established, see inner exception.
+          # The remote certificate is invalid because of errors in the certificate chain: UntrustedRoot
+          apt install --yes --no-install-recommends ca-certificates
+
+          apt install --yes --no-install-recommends dotnet6
+      - name: Checkout conventions repo
+        run: |
+          git clone https://github.com/nblockchain/conventions.git
+          rm -rf ./conventions/.git/
+      - name: Check commits 1 by 1
+        run: dotnet fsi ./conventions/scripts/checkCommits1by1.fsx
+
+  post-conventions:
+    name: Check style & commit msg conventions
+    if: github.event_name == 'push' || (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
+    runs-on: ubuntu-22.04
+    container:
+      image: "ubuntu:22.04"
+
+    steps:
+    - uses: actions/checkout@v1
+      with:
+        submodules: false
+    - name: Install dependencies of commitlint
+      run: |
+        which sudo 2>/dev/null || (apt update && apt install --yes sudo)
+        sudo apt update
+
+        sudo apt install --yes --no-install-recommends git npm curl
+        sudo npm install --global n
+        sudo n lts
+    # workaround for https://github.com/actions/runner/issues/2033
+    - name: ownership workaround
+      run: git config --global --add safe.directory '*'
+    - name: Pull our commitlint configuration
+      run: |
+        git clone https://github.com/nblockchain/conventions.git
+        rm -rf ./conventions/.git/
+    - name: Validate current commit (last commit) with commitlint
+      if: github.event_name == 'push'
+      run: ./conventions/commitlint.sh --from HEAD~1 --to HEAD --verbose
+    - name: Validate PR commits with commitlint
+      if: github.event_name == 'pull_request'
+      run: ./conventions/commitlint.sh --from ${{ github.event.pull_request.head.sha }}~${{ github.event.pull_request.commits }} --to ${{ github.event.pull_request.head.sha }} --verbose
+
+    - name: Check XAML style with prettier
+      run: |
+        sudo npm install --save-dev @prettier/plugin-xml@2.2.0 prettier@2.8.3
+        ./node_modules/.bin/prettier --xml-whitespace-sensitivity ignore --tab-width 4 --prose-wrap preserve --write '**/*.xaml'
+        git diff --exit-code
+
+    - name: Install .NET6
+      run: |
+        apt update && apt install --yes sudo
+        sudo apt install --yes curl dotnet6
+    - name: Check F# style with fantomless
+      run: |
+        dotnet new tool-manifest
+        dotnet tool install fantomless-tool --version 4.7.996
+        dotnet fantomless --recurse .
+        git diff --exit-code
+    - name: Check C# style with dotnet format
+      run: |
+        dotnet format whitespace ./src --folder
+        git diff --exit-code
+
+  prepare:
+    name: (Meta) Prepare release
+    needs: post-conventions
+    runs-on: ubuntu-22.04
+    container:
+      image: "ubuntu:22.04"
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Create Release
+        id: create_release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+  build-linux-backend:
+    name: (Linux) Build+Test Backend & Publish
+    needs: prepare
+    runs-on: ubuntu-22.04
+    container:
+      image: "ubuntu:22.04"
+    outputs:
+      upload_url: ${{ needs.prepare.outputs.upload_url }}
+    steps:
+
+      # beware about using v2 because https://github.com/actions/checkout/issues/100
+      - uses: actions/checkout@v1
+        with:
+          submodules: recursive
+
+      - name: Install .NET 6 and dependencies
+        run: |
+          apt update && apt install --yes sudo
+          sudo apt install --yes curl dotnet6 git ca-certificates
+
+      # workaround for https://github.com/actions/runner/issues/2033
+      - name: ownership workaround
+        run: git config --global --add safe.directory '*'
+
+      - name: Create DB
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt install postgresql --yes
+          sudo service postgresql start
+          sudo -u postgres createdb runintomedb
+          sudo -u postgres psql --echo-all --dbname runintomedb --file db/createDBCommands.sql
+          sudo -u postgres psql --echo-all --dbname postgres --command "ALTER USER postgres WITH PASSWORD 'localDevPassword';"
+
+      - name: Build backend
+        run: |
+          mkdir packages
+          dotnet restore backend.slnf
+          dotnet build backend.slnf
+
+      - name: Run tests
+        run: dotnet test tests/Backend.Tests
+
+      - name: Publish for linux
+        run: |
+          mkdir publish
+          # Create a platform-specific self-contained executable (no need to install .NET runtime on the target machine)
+          # More info: https://docs.microsoft.com/en-us/dotnet/core/deploying/
+          dotnet publish src/GrpcService/GrpcService.csproj -p:PublishSingleFile=true -r linux-x64 -c Release -o publish --self-contained true
+
+      - name: Create version.txt file
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "$GITHUB_REF_NAME" > publish/version.txt
+
+      - name: Archive publish and SQL folder
+        run: |
+          sudo apt install --yes zip
+          zip runIntoMe-db.zip db/*.sql
+          cd publish
+          zip -r ../runIntoMe-server-linux-amd64.zip *
+          # is this needed?
+          cd ..
+
+      # disabled for now (useful only when we try to remove GreenBlue-gitTag-deployment system)
+      #- name: Version Sanity Check
+      #  if: startsWith(github.ref, 'refs/tags/')
+      #  run: dotnet fsi scripts/version_sanity_check.fsx
+
+      # if any of the below upload steps fails with something like 'failed, reason: read ECONNRESET',
+      # then just retry the job (sometimes it worked for me on the 4th time)
+      - name: Upload Server As Release Asset
+        id: upload-server-asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ needs.prepare.outputs.upload_url }}
+          asset_path: ./runIntoMe-server-linux-amd64.zip
+          asset_name: runIntoMe-server-linux-amd64.zip
+          asset_content_type: application/zip
+      - name: Upload DB As Release Asset
+        id: upload-db-asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ needs.prepare.outputs.upload_url }}
+          asset_path: ./runIntoMe-db.zip
+          asset_name: runIntoMe-db.zip
+          asset_content_type: application/zip
+
+  build-linux-frontend-android:
+    name: (Linux) Build Android Frontend
+    needs: build-linux-backend
+    runs-on: ubuntu-22.04
+    steps:
+      # beware about using v2 because https://github.com/actions/checkout/issues/100
+      - uses: actions/checkout@v1
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v2
+        with:
+          dotnet-version: 7.0.x
+
+      - name: Workaround possible sudo-related dotnet problem
+        run: dotnet --help
+
+      - name: Restore workloads
+        # TODO: maybe try to sync this step with previous one via e.g. --sdk-version 7.0.9
+        #       (but not sure if this only worked with 'dotnet workload install', maybe it doesn't
+        #       work with 'dotnet workload restore')
+        run: sudo dotnet workload restore
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Frontend (Android)
+        run: |
+          sudo dotnet build src/Frontend/Frontend.csproj \
+            --framework net7.0-android \
+            --configuration Debug \
+            -p:AndroidSdkDirectory=/usr/local/lib/android/sdk \
+            -p:AndroidOnly=true
+
+      - name: Publish Frontend (Android)
+        if: "${{ env.ANDROID_KEYSTORE_PASSWORD != ''}}"
+        run: |
+          sudo dotnet publish src/Frontend/Frontend.csproj \
+            --framework net7.0-android \
+            --configuration Release \
+            -p:AndroidSdkDirectory=/usr/local/lib/android/sdk \
+            -p:AndroidSigningKeyPass="${{ env.ANDROID_KEYSTORE_PASSWORD }}" \
+            -p:AndroidSigningStorePass="${{ env.ANDROID_KEYSTORE_PASSWORD }}" \
+            -p:AndroidOnly=true
+
+      # Upload artifact fails with "permission denied" error without this
+      - name: Fix permissions
+        if: "${{ env.ANDROID_KEYSTORE_PASSWORD != ''}}"
+        run: sudo chmod -R 755 src/Frontend/bin/Release/net7.0-android/publish
+
+      - name: Find the APK file's path and name
+        id: find_apk_file
+        if: "${{ env.ANDROID_KEYSTORE_PASSWORD != ''}}"
+        run: |
+          FILEPATH=$(ls src/Frontend/bin/Release/net7.0-android/publish/*.apk)
+          FILENAME=$(basename $FILEPATH)
+          echo "file_path=$FILEPATH" >> $GITHUB_OUTPUT
+          echo "file_name=$FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Upload APK as CI artifact
+        uses: actions/upload-artifact@v3
+        if: "${{ env.ANDROID_KEYSTORE_PASSWORD != ''}}"
+        with:
+          path: ${{ steps.find_apk_file.outputs.file_path }}
+          name: ${{ steps.find_apk_file.outputs.file_name }}
+
+      - name: Upload APK to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ needs.build-linux-backend.outputs.upload_url }}
+          asset_path: ${{ steps.find_apk_file.outputs.file_path }}
+          asset_name: ${{ steps.find_apk_file.outputs.file_name }}      
+          asset_content_type: application/vnd.android.package-archive
+
+      - name: Upload APK artifact to our artifacts repo
+        if: ${{ env.ANDROID_KEYSTORE_PASSWORD != '' && env.ACCESS_TOKEN != '' }}
+        run: dotnet fsi scripts/upload_binary_artifacts.fsx src/Frontend/bin/Release/net7.0-android/publish/*.apk
+
+  build-windows:
+    name: (Windows) Build Windows&Android Frontends
+    needs: build-linux-frontend-android
+    runs-on: windows-2022
+
+    steps:
+
+      - uses: actions/checkout@v1
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v2
+        with:
+          dotnet-version: 7.0.x
+
+      - name: Restore workloads
+        run: dotnet workload restore
+
+      - name: Restore packages
+        run: dotnet restore
+
+      - name: Build Frontend (Windows)
+        run: dotnet build src\Frontend\Frontend.csproj --no-restore --framework net7.0-windows10.0.19041
+
+      - name: Build Frontend (Android)
+        # to save CI minutes, we only do this at tag time (Android frontend is already built in Linux, so unlikely to break in Windows)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: dotnet build src\Frontend\Frontend.csproj --no-restore --framework net7.0-android
+
+  build-macOS-backend:
+    name: (macOS) Build+Test Backend
+    needs: build-windows
+    runs-on: macos-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+
+      # beware about using v2 because https://github.com/actions/checkout/issues/100
+      - uses: actions/checkout@v1
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v2
+        with:
+          dotnet-version: 7.0.x
+
+      - name: Create DB
+        run: |
+          brew install postgresql@14
+
+          # NOTE: if the below command doesn't seem to launch pg service on your MacBook, try this instead: pg_ctl -D /usr/local/var/postgres start
+          brew services restart postgresql@14
+
+          brew link postgresql@14 --force
+          /usr/local/opt/postgresql@14/bin/createuser --superuser postgres
+          /usr/local/opt/postgresql@14/bin/createdb runintomedb
+          /usr/local/opt/postgresql@14/bin/psql --echo-all --dbname runintomedb --file db/createDBCommands.sql
+          /usr/local/opt/postgresql@14/bin/psql --echo-all --dbname postgres --command "ALTER USER postgres WITH PASSWORD 'localDevPassword';"
+
+      - name: Build backend
+        run: |
+          mkdir packages
+          dotnet restore backend.slnf
+          dotnet build backend.slnf
+
+      - name: Run tests
+        run: dotnet test tests/Backend.Tests
+
+  build-macOS-frontends:
+    name: (macOS) Build Android+iOS Frontends
+    needs: [build-windows, build-linux-backend]
+    runs-on: macos-latest
+    steps:
+
+      # beware about using v2 because https://github.com/actions/checkout/issues/100
+      - uses: actions/checkout@v1
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v2
+        with:
+          dotnet-version: 7.0.x
+
+      - name: Restore workloads
+        run: dotnet workload restore
+
+      - name: Restore packages
+        run: dotnet restore
+
+      - name: Build Frontend (Android)
+        # to save CI minutes, we only do this at tag time (Android frontend is already built in Linux, so unlikely to break in macOS)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: dotnet build src/Frontend/Frontend.csproj --no-restore --framework net7.0-android
+
+      - name: Install provisioning profile
+        run: |
+          # create variables
+          PP_PATH=src/Frontend/Platforms/iOS/RimDis.mobileprovision
+          # apply provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
+
+      - name: Build Frontend without publish (iOS)
+        if: "${{ env.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD == '' }}"
+        run: |
+          dotnet build src/Frontend/Frontend.csproj --configuration Release --no-restore --framework net7.0-ios
+
+      - name: Publish Frontend (iOS)
+        if: "${{ env.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD != '' }}"
+        run: |
+          DISTRIBUTION_CERTIFICATE_PATH=src/Frontend/Platforms/iOS/DistributionCertificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          # create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # import certificate to keychain
+          security import "$DISTRIBUTION_CERTIFICATE_PATH" -P "${{ env.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          dotnet publish src/Frontend/Frontend.csproj --configuration Release --framework net7.0-ios --runtime ios-arm64 --output ./bin/publish 
+
+      - name: Upload IPA as CI artifact
+        if: "${{ env.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD != '' }}"
+        uses: actions/upload-artifact@v3
+        with:
+          path: ./bin/publish/Frontend.ipa
+          name: Frontend.ipa
+
+      - name: Upload IPA to Release
+        if: ${{ env.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD != '' && startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ needs.build-linux-backend.outputs.upload_url }}
+          asset_path: ./bin/publish/Frontend.ipa
+          asset_name: Frontend.ipa
+          asset_content_type: application/octet-stream
+
+      - name: Upload IPA artifact to our artifacts repo
+        if: ${{ env.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD != '' && env.ACCESS_TOKEN != '' }}
+        run: dotnet fsi scripts/upload_binary_artifacts.fsx ./bin/publish/*.ipa
+
+  # NOTE: if this step doesn't work, see https://stackoverflow.com/a/75250838/1623521
+  delete-old-artifacts-and-release-assets:
+    if: github.event_name == 'push'
+    name: Delete artifacts from WIP branches (in bin repo), other commits and old release assets
+    needs: build-macOS-frontends
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: Close session for uploading artifacts to git repo
+        if: ${{ env.ACCESS_TOKEN != '' && (env.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD != '' || env.ANDROID_KEYSTORE_PASSWORD != '') }}
+        run: dotnet fsi scripts/upload_binary_artifacts.fsx --dispose
+      - name: Delete artifacts from other CI jobs
+        run: ./scripts/delete_artifacts.fsx
+      - name: Delete release assets from tags older than the 2 newest ones
+        run: ./scripts/delete_assets_from_old_releases.fsx
